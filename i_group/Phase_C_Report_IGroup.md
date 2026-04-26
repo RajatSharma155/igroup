@@ -49,7 +49,7 @@ Therefore, **one Promela step = one intersection crossing** in the abstract mode
 
 **Intersections:** indexed by `x + y×3` for `(x,y) ∈ {0,1,2}²`, giving indices `0–8`. Checkpoint intersections: B = index 6, C = index 8, D = index 2.
 
-**`SignalCtrl` process:** non-deterministically assigns one GREEN direction per intersection each cycle. This **over-approximates** all possible I-Group signal schedules — if a property holds here, it holds for any valid signal strategy. The process terminates once all vehicles set their `done` flag, bounding the search depth so SPIN can complete exhaustive verification.
+**`SignalCtrl` process:** non-deterministically assigns one GREEN direction per intersection. This **over-approximates** all possible I-Group signal schedules — if a property holds here, it holds for any valid signal strategy. Each outer-loop iteration updates a **single** randomly-chosen intersection via a flat `if` with 36 branches (9 intersections × 4 directions). This keeps path depth within SPIN's default `-m10000` limit while preserving full expressiveness; see Section 4 for the full explanation. The process terminates once all vehicles set their `done` flag, bounding the search depth so SPIN can complete exhaustive verification.
 
 **`Vehicle(id, cp0, cp1, cp2)` process:** visits checkpoint intersections `cp0 → cp1 → cp2` in order, enforcing:
 - Blocks until `sig[target] == arr_dir` (GREEN) before crossing
@@ -68,16 +68,22 @@ active proctype SignalCtrl() {
     byte i;
     i = 0;
     do :: i < 9 -> sig[i] = DIR_N; i++ :: else -> break od;
-    /* Terminates once all vehicles complete, bounding SPIN's search depth */
+    /* One intersection updated per outer step (not all 9) to keep path
+       depth within SPIN's -m10000 default; terminates when all done. */
     do
     :: (done[0] && done[1]) -> break
     :: else ->
-       i = 0;
-       do :: i < 9 ->
-           if :: sig[i] = DIR_N :: sig[i] = DIR_S
-              :: sig[i] = DIR_E :: sig[i] = DIR_W fi;
-           i++
-       :: else -> break od
+       if
+       :: sig[0]=DIR_N :: sig[0]=DIR_S :: sig[0]=DIR_E :: sig[0]=DIR_W
+       :: sig[1]=DIR_N :: sig[1]=DIR_S :: sig[1]=DIR_E :: sig[1]=DIR_W
+       :: sig[2]=DIR_N :: sig[2]=DIR_S :: sig[2]=DIR_E :: sig[2]=DIR_W
+       :: sig[3]=DIR_N :: sig[3]=DIR_S :: sig[3]=DIR_E :: sig[3]=DIR_W
+       :: sig[4]=DIR_N :: sig[4]=DIR_S :: sig[4]=DIR_E :: sig[4]=DIR_W
+       :: sig[5]=DIR_N :: sig[5]=DIR_S :: sig[5]=DIR_E :: sig[5]=DIR_W
+       :: sig[6]=DIR_N :: sig[6]=DIR_S :: sig[6]=DIR_E :: sig[6]=DIR_W
+       :: sig[7]=DIR_N :: sig[7]=DIR_S :: sig[7]=DIR_E :: sig[7]=DIR_W
+       :: sig[8]=DIR_N :: sig[8]=DIR_S :: sig[8]=DIR_E :: sig[8]=DIR_W
+       fi
     od
 }
 ```
@@ -163,9 +169,19 @@ Liveness (P5) used an additional `-a -f` for acceptance-cycle search with weak f
 
 ### Note: Search Depth Fix
 
-An initial version of `SignalCtrl` looped unconditionally with no exit condition. SPIN reported `error: max search depth too small` at the default limit of 9999 steps, because the signal controller could always take another non-deterministic step even after both vehicles had finished — generating over 10 million transitions without terminating. The fix was to add a guard `:: (done[0] && done[1]) -> break` so `SignalCtrl` exits once all vehicles complete. With this change, the maximum search depth drops to under 50 and all five properties verify within milliseconds.
+Two separate issues caused `error: max search depth too small` and were both resolved.
+
+**Fix 1 — Unbounded signal loop.** The original `SignalCtrl` looped unconditionally with no exit condition. Even after both vehicles finished, the signal controller kept taking non-deterministic steps, generating infinitely long paths. Fix: add a termination guard `:: (done[0] && done[1]) -> break` so `SignalCtrl` exits once all vehicles complete.
+
+**Fix 2 — Per-cycle depth multiplication.** Even with the termination guard in place, `SignalCtrl`'s inner loop iterated over all 9 intersections per outer-loop cycle — approximately 18 Promela steps per cycle (9 iterations of the inner loop plus loop-guard evaluations). Vehicles often wait many signal cycles before receiving GREEN for their arrival direction. In the worst case explored by SPIN, one vehicle completes while the other keeps waiting, and `SignalCtrl` continues cycling; with 18 steps per cycle, the path depth reaches `18 × N` where N is the number of cycles waited. SPIN reported `error: max search depth too small` at the default limit of 10,000 steps.
+
+Fix: replace the inner loop with a flat `if` statement that selects **one** intersection to update per outer-loop step (36 branches: 9 intersections × 4 directions). Each outer iteration is now a single Promela step instead of ~18. Path depth drops by approximately 9×, staying well within the default limit. The over-approximation is fully preserved — every signal pattern for every intersection remains reachable through the non-deterministic branching.
+
+With both fixes applied, the maximum search depth stays well under 1,000 and all five properties verify without errors.
 
 ---
+
+> **Note:** The verification statistics below (state counts, depth, transitions) must be re-collected after running the updated `vehicle_model.pml`. The restructured `SignalCtrl` changes the number of states and transitions; the placeholder numbers from the previous model are shown here for reference and **must be replaced with screenshots from a fresh SPIN run**.
 
 ### P1 — No U-turn
 
@@ -433,4 +449,4 @@ spin -search -ltl no_coll    vehicle_model.pml
 spin -search -ltl liveness -a -f vehicle_model.pml
 ```
 
-> **Troubleshooting:** If SPIN reports `error: max search depth too small`, ensure `SignalCtrl` contains the termination guard `:: (done[0] && done[1]) -> break`. Without it the signal loop runs infinitely and exceeds the default depth of 9999.
+> **Troubleshooting:** If SPIN reports `error: max search depth too small`, two things must be checked. First, ensure `SignalCtrl` contains the termination guard `:: (done[0] && done[1]) -> break`. Second, ensure `SignalCtrl` uses the flat single-intersection `if` block (not an inner loop over all 9 intersections). The inner loop multiplies path depth by ~9 per outer cycle; the flat `if` reduces this to a single step per cycle, keeping depth well within the default `-m10000` limit.

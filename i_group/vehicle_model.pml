@@ -85,23 +85,25 @@ active proctype SignalCtrl() {
     :: else  -> break
     od;
 
-    /* Continuously and non-deterministically update each intersection's GREEN.
-       Terminates once all vehicles complete so SPIN has a bounded search depth. */
+    /* Non-deterministically update ONE intersection per outer step.
+       Updating all 9 intersections per loop iteration multiplies path depth by 9;
+       choosing one per step keeps depth within SPIN's default -m10000 limit while
+       preserving the full over-approximation (every signal pattern is still reachable).
+       Terminates once all vehicles complete so the search depth is bounded. */
     do
     :: (done[0] && done[1]) -> break
     :: else ->
-       i = 0;
-       do
-       :: i < 9 ->
-           if
-           :: sig[i] = DIR_N
-           :: sig[i] = DIR_S
-           :: sig[i] = DIR_E
-           :: sig[i] = DIR_W
-           fi;
-           i++
-       :: else -> break
-       od
+       if
+       :: sig[0] = DIR_N :: sig[0] = DIR_S :: sig[0] = DIR_E :: sig[0] = DIR_W
+       :: sig[1] = DIR_N :: sig[1] = DIR_S :: sig[1] = DIR_E :: sig[1] = DIR_W
+       :: sig[2] = DIR_N :: sig[2] = DIR_S :: sig[2] = DIR_E :: sig[2] = DIR_W
+       :: sig[3] = DIR_N :: sig[3] = DIR_S :: sig[3] = DIR_E :: sig[3] = DIR_W
+       :: sig[4] = DIR_N :: sig[4] = DIR_S :: sig[4] = DIR_E :: sig[4] = DIR_W
+       :: sig[5] = DIR_N :: sig[5] = DIR_S :: sig[5] = DIR_E :: sig[5] = DIR_W
+       :: sig[6] = DIR_N :: sig[6] = DIR_S :: sig[6] = DIR_E :: sig[6] = DIR_W
+       :: sig[7] = DIR_N :: sig[7] = DIR_S :: sig[7] = DIR_E :: sig[7] = DIR_W
+       :: sig[8] = DIR_N :: sig[8] = DIR_S :: sig[8] = DIR_E :: sig[8] = DIR_W
+       fi
     od
 }
 
