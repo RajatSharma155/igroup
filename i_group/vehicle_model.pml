@@ -85,9 +85,12 @@ active proctype SignalCtrl() {
     :: else  -> break
     od;
 
-    /* Continuously and non-deterministically update each intersection's GREEN */
+    /* Continuously and non-deterministically update each intersection's GREEN.
+       Terminates once all vehicles complete so SPIN has a bounded search depth. */
     do
-    :: i = 0;
+    :: (done[0] && done[1]) -> break
+    :: else ->
+       i = 0;
        do
        :: i < 9 ->
            if

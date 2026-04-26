@@ -49,7 +49,7 @@ Therefore, **one Promela step = one intersection crossing** in the abstract mode
 
 **Intersections:** indexed by `x + y×3` for `(x,y) ∈ {0,1,2}²`, giving indices `0–8`. Checkpoint intersections: B = index 6, C = index 8, D = index 2.
 
-**`SignalCtrl` process:** non-deterministically assigns one GREEN direction per intersection each cycle. This **over-approximates** all possible I-Group signal schedules — if a property holds here, it holds for any valid signal strategy.
+**`SignalCtrl` process:** non-deterministically assigns one GREEN direction per intersection each cycle. This **over-approximates** all possible I-Group signal schedules — if a property holds here, it holds for any valid signal strategy. The process terminates once all vehicles set their `done` flag, bounding the search depth so SPIN can complete exhaustive verification.
 
 **`Vehicle(id, cp0, cp1, cp2)` process:** visits checkpoint intersections `cp0 → cp1 → cp2` in order, enforcing:
 - Blocks until `sig[target] == arr_dir` (GREEN) before crossing
@@ -68,8 +68,11 @@ active proctype SignalCtrl() {
     byte i;
     i = 0;
     do :: i < 9 -> sig[i] = DIR_N; i++ :: else -> break od;
+    /* Terminates once all vehicles complete, bounding SPIN's search depth */
     do
-    :: i = 0;
+    :: (done[0] && done[1]) -> break
+    :: else ->
+       i = 0;
        do :: i < 9 ->
            if :: sig[i] = DIR_N :: sig[i] = DIR_S
               :: sig[i] = DIR_E :: sig[i] = DIR_W fi;
@@ -157,6 +160,10 @@ Each property was verified with:
 spin -search -ltl <property_name> vehicle_model.pml
 ```
 Liveness (P5) used an additional `-a -f` for acceptance-cycle search with weak fairness.
+
+### Note: Search Depth Fix
+
+An initial version of `SignalCtrl` looped unconditionally with no exit condition. SPIN reported `error: max search depth too small` at the default limit of 9999 steps, because the signal controller could always take another non-deterministic step even after both vehicles had finished — generating over 10 million transitions without terminating. The fix was to add a guard `:: (done[0] && done[1]) -> break` so `SignalCtrl` exits once all vehicles complete. With this change, the maximum search depth drops to under 50 and all five properties verify within milliseconds.
 
 ---
 
@@ -418,10 +425,12 @@ sudo apt-get install spin gcc
 # Copy model file
 cp i_group/vehicle_model.pml ~/vehicle_model.pml && cd ~
 
-# Verify each property
+# Verify each property (SignalCtrl terminates on done[0]&&done[1], so no depth flag needed)
 spin -search -ltl no_uturn   vehicle_model.pml
 spin -search -ltl no_red     vehicle_model.pml
 spin -search -ltl visit_all  vehicle_model.pml
 spin -search -ltl no_coll    vehicle_model.pml
 spin -search -ltl liveness -a -f vehicle_model.pml
 ```
+
+> **Troubleshooting:** If SPIN reports `error: max search depth too small`, ensure `SignalCtrl` contains the termination guard `:: (done[0] && done[1]) -> break`. Without it the signal loop runs infinitely and exceeds the default depth of 9999.
