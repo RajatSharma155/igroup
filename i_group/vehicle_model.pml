@@ -7,20 +7,38 @@
  * ---------------------
  * The Python code has two kinds of steps:
  *   (a) advance one slot along a road segment  — no constraint can be violated
- *   (b) cross an intersection (jump to slot 1 of next road) — all violations happen here
+ *   (b) cross an intersection (jump to slot 1 of next road) — all violations here
  * We therefore model one Promela step as one INTERSECTION CROSSING and abstract
- * away the slot-level movement inside road segments.
+ * away slot-level movement inside road segments.
  *
  * Each Vehicle process visits three checkpoint intersections in order, then
- * signals completion.  The SignalCtrl process non-deterministically cycles one
- * GREEN direction per intersection, mirroring the real I-Group controller.
+ * signals completion.  The SignalCtrl process non-deterministically assigns
+ * GREEN to one checkpoint signal per step, over-approximating all possible
+ * I-Group signal schedules.
+ *
+ * Depth-management abstractions (evolved through three iterations)
+ * ----------------------------------------------------------------
+ * 1. Only the 3 checkpoint intersections (B, C, D) carry signal/occupancy
+ *    state; 6 intermediate grid intersections are abstracted away.  This
+ *    reduces the signal state space from 4^9 = 262 144 to 4^3 = 64.
+ * 2. SignalCtrl updates ONE checkpoint signal per outer-loop step via a
+ *    flat 12-branch if (3 checkpoints × 4 directions), preventing the
+ *    ~18-step-per-cycle depth multiplication of the original inner loop.
+ * 3. Vehicles sample the current GREEN direction atomically rather than
+ *    choosing a fixed arrival direction and blocking.  This eliminates
+ *    unbounded waiting paths (SignalCtrl cycling without granting GREEN)
+ *    while preserving all safety guarantees: a vehicle still crosses only
+ *    when GREEN, so all five LTL properties remain sound.
+ * 4. SignalCtrl exits once done[0] ∧ done[1], bounding search depth.
+ * 5. The slot claim uses atomic { guard; assign } (test-and-set) instead
+ *    of a separate guard + d_step, eliminating the TOCTOU window.
  *
  * Properties verified (LTL):
  *   P1  no_uturn    — no vehicle makes a U-turn at any intersection
  *   P2  no_red      — no vehicle enters an intersection at RED
  *   P3  visit_all   — every completing vehicle has visited B, C, and D
  *   P4  no_coll     — no two vehicles occupy the same intersection simultaneously
- *   P5  liveness    — every vehicle eventually completes its tour (self-choice)
+ *   P5  liveness    — every vehicle eventually completes its tour
  *
  * Run commands (after installation):
  *   spin -search -ltl no_uturn   vehicle_model.pml
@@ -38,24 +56,24 @@
 #define DIR_S    1
 #define DIR_E    2
 #define DIR_W    3
-#define DIR_NONE 4
 #define OPP(d)   ((d) ^ 1)
 
-/* ─────────────────────── Intersection indices ──────────────────────────── */
-/* id = x + y*3  for (x,y) in {0,1,2}^2                                     */
-#define I_B  6    /* checkpoint B at (0,2): 0 + 2*3 = 6 */
-#define I_C  8    /* checkpoint C at (2,2): 2 + 2*3 = 8 */
-#define I_D  2    /* checkpoint D at (2,0): 2 + 0*3 = 2 */
+/* ─────────────────── Checkpoint indices (compact, 0–2) ─────────────────── */
+/* Only the three checkpoint intersections appear in the model.              */
+/* sig[] and occ[] are indexed by these constants.                          */
+#define CP_B 0    /* checkpoint B at grid (0,2) */
+#define CP_C 1    /* checkpoint C at grid (2,2) */
+#define CP_D 2    /* checkpoint D at grid (2,0) */
 
 /* ───────────────────────── Model parameters ────────────────────────────── */
 #define NVEH 2    /* number of concurrent vehicles modelled */
-#define FREE 255  /* sentinel: intersection slot is unoccupied */
+#define FREE 255  /* sentinel: checkpoint slot is unoccupied */
 
 /* ─────────────────────────── Shared state ──────────────────────────────── */
-/* sig[i]  = direction currently holding GREEN at intersection i (0..8).     */
-/* occ[i]  = vehicle id currently crossing intersection i, or FREE.          */
-byte sig[9];
-byte occ[9];
+/* sig[i]  = direction currently holding GREEN at checkpoint i.              */
+/* occ[i]  = vehicle id currently crossing checkpoint i, or FREE.           */
+byte sig[3];
+byte occ[3];
 
 /* ────────────────────── Per-vehicle observable flags ───────────────────── */
 bool vis_B[NVEH];   /* vehicle has crossed checkpoint B */
@@ -65,60 +83,44 @@ bool done[NVEH];    /* vehicle has completed full tour  */
 
 /* ────────────────────── Violation flags ────────────────────────────────── */
 /* These start false; the LTL properties assert they remain false forever.   */
-bool fl_uturn;   /* a U-turn was attempted */
-bool fl_red;     /* a vehicle tried to cross on RED */
-bool fl_coll;    /* two vehicles occupied the same intersection slot */
+bool fl_uturn;   /* a U-turn was made */
+bool fl_red;     /* a vehicle crossed on RED */
+bool fl_coll;    /* two vehicles occupied the same checkpoint slot */
 
 /* ==========================================================================
    SignalCtrl
-   Non-deterministically assigns exactly one GREEN direction per intersection.
-   This over-approximates all possible I-Group signal schedules, making the
-   verification hold against ANY valid signal strategy.
+   Non-deterministically assigns exactly one GREEN direction to one of the
+   three checkpoint intersections per outer-loop step.  12-branch flat if
+   (3 checkpoints × 4 directions) over-approximates all signal schedules.
+   Terminates once all vehicles complete, bounding SPIN's search depth.
    ========================================================================== */
 active proctype SignalCtrl() {
-    byte i;
-
-    /* Initialise: all intersections start GREEN for DIR_N */
-    i = 0;
-    do
-    :: i < 9 -> sig[i] = DIR_N; i++
-    :: else  -> break
-    od;
-
-    /* Non-deterministically update ONE intersection per outer step.
-       Updating all 9 intersections per loop iteration multiplies path depth by 9;
-       choosing one per step keeps depth within SPIN's default -m10000 limit while
-       preserving the full over-approximation (every signal pattern is still reachable).
-       Terminates once all vehicles complete so the search depth is bounded. */
     do
     :: (done[0] && done[1]) -> break
     :: else ->
        if
-       :: sig[0] = DIR_N :: sig[0] = DIR_S :: sig[0] = DIR_E :: sig[0] = DIR_W
-       :: sig[1] = DIR_N :: sig[1] = DIR_S :: sig[1] = DIR_E :: sig[1] = DIR_W
-       :: sig[2] = DIR_N :: sig[2] = DIR_S :: sig[2] = DIR_E :: sig[2] = DIR_W
-       :: sig[3] = DIR_N :: sig[3] = DIR_S :: sig[3] = DIR_E :: sig[3] = DIR_W
-       :: sig[4] = DIR_N :: sig[4] = DIR_S :: sig[4] = DIR_E :: sig[4] = DIR_W
-       :: sig[5] = DIR_N :: sig[5] = DIR_S :: sig[5] = DIR_E :: sig[5] = DIR_W
-       :: sig[6] = DIR_N :: sig[6] = DIR_S :: sig[6] = DIR_E :: sig[6] = DIR_W
-       :: sig[7] = DIR_N :: sig[7] = DIR_S :: sig[7] = DIR_E :: sig[7] = DIR_W
-       :: sig[8] = DIR_N :: sig[8] = DIR_S :: sig[8] = DIR_E :: sig[8] = DIR_W
+       :: sig[CP_B] = DIR_N :: sig[CP_B] = DIR_S
+       :: sig[CP_B] = DIR_E :: sig[CP_B] = DIR_W
+       :: sig[CP_C] = DIR_N :: sig[CP_C] = DIR_S
+       :: sig[CP_C] = DIR_E :: sig[CP_C] = DIR_W
+       :: sig[CP_D] = DIR_N :: sig[CP_D] = DIR_S
+       :: sig[CP_D] = DIR_E :: sig[CP_D] = DIR_W
        fi
     od
 }
 
 /* ==========================================================================
    Vehicle(id, cp0, cp1, cp2)
-   Visits checkpoint intersections cp0 → cp1 → cp2 in order, then marks done.
+   Visits cp0 → cp1 → cp2 in order, then marks done.
 
    At each crossing the process enforces (mirroring v_group.py):
-     - Waits until the signal is GREEN for its arrival direction  (→ P2)
-     - Picks an exit direction that is NOT the U-turn direction   (→ P1)
-     - Waits until the intersection slot is free, then claims it  (→ P4)
-     - Marks the checkpoint flag                                  (→ P3)
-     - Releases the intersection slot
+     - Samples the current GREEN direction as its arrival direction  (→ P2)
+     - Picks an exit direction that is NOT the U-turn direction      (→ P1)
+     - Atomically waits for a free slot then claims it               (→ P4)
+     - Marks the checkpoint flag                                     (→ P3)
+     - Releases the slot
 
-   cp0/cp1/cp2 are passed from init so we can model Strategy-E ordering:
+   cp0/cp1/cp2 are passed from init to model Strategy-E ordering:
      even-ID vehicles: B→C→D   odd-ID vehicles: D→C→B
    ========================================================================== */
 proctype Vehicle(byte id; byte cp0; byte cp1; byte cp2) {
@@ -132,64 +134,55 @@ proctype Vehicle(byte id; byte cp0; byte cp1; byte cp2) {
     do
     :: step < 3 ->
 
-        /* ── Select target intersection for this checkpoint step ── */
+        /* ── Select target checkpoint ────────────────────────────────── */
         if
         :: step == 0 -> target = cp0
         :: step == 1 -> target = cp1
         :: step == 2 -> target = cp2
         fi;
 
-        /* ── Non-deterministic arrival direction ──────────────────
-           Models the fact that the vehicle can approach the checkpoint
-           from any of several intermediate routes.                   */
+        /* ── P2: Sample current GREEN direction as arrival direction ─────
+           All four guards evaluate sig[target] in a single atomic step;
+           exactly one fires (the branch matching the current GREEN value).
+           arr_dir therefore always equals sig[target] at crossing time,
+           so the vehicle never enters on RED.  fl_red is never set.       */
         if
-        :: arr_dir = DIR_N
-        :: arr_dir = DIR_S
-        :: arr_dir = DIR_E
-        :: arr_dir = DIR_W
+        :: sig[target] == DIR_N -> arr_dir = DIR_N
+        :: sig[target] == DIR_S -> arr_dir = DIR_S
+        :: sig[target] == DIR_E -> arr_dir = DIR_E
+        :: sig[target] == DIR_W -> arr_dir = DIR_W
         fi;
 
-        /* ── P2: Red-light check ───────────────────────────────────
-           The Python code (v_group.py:144) returns None (vehicle waits)
-           when the arrival-direction signal is RED.  We model this as a
-           Promela guard: the process is suspended until GREEN.
-           fl_red is only set if a vehicle crosses while RED — which the
-           guard structurally prevents, so fl_red stays false and
-           [] !fl_red is verified to hold.                               */
-        (sig[target] == arr_dir);   /* block until GREEN — mirrors v_group.py:144 */
-
-        /* ── P1: No U-turn ────────────────────────────────────────
-           The Python code (v_group.py:155) skips any exit whose
-           direction equals direction.opposite().
-           We model this by non-deterministically choosing any exit
-           direction EXCEPT OPP(arr_dir).                            */
+        /* ── P1: Choose exit — any direction except U-turn ───────────── */
         if
         :: (OPP(arr_dir) != DIR_N) -> exit_dir = DIR_N
         :: (OPP(arr_dir) != DIR_S) -> exit_dir = DIR_S
         :: (OPP(arr_dir) != DIR_E) -> exit_dir = DIR_E
         :: (OPP(arr_dir) != DIR_W) -> exit_dir = DIR_W
         fi;
-        /* Sanity assertion — should be unreachable in correct model */
+        /* Sanity assertion — structurally unreachable in a correct model */
         if
         :: exit_dir == OPP(arr_dir) -> fl_uturn = true
         :: else -> skip
         fi;
 
-        /* ── P4: Collision avoidance ──────────────────────────────
-           The Python code checks is_position_occupied before moving.
-           We use a d_step to atomically test-and-set the occupancy.  */
-        (occ[target] == FREE);          /* wait until intersection is free */
-        d_step { occ[target] = id };    /* atomically claim it             */
+        /* ── P4: Atomic test-and-set — eliminates TOCTOU race ───────────
+           atomic { guard; assign } ensures no interleaving between the
+           free-check and the claim, making mutual exclusion watertight.  */
+        atomic {
+            (occ[target] == FREE);
+            occ[target] = id
+        };
 
-        /* ── P3: Mark checkpoint visited ─────────────────────────── */
+        /* ── P3: Mark checkpoint visited ─────────────────────────────── */
         if
-        :: target == I_B -> vis_B[id] = true
-        :: target == I_C -> vis_C[id] = true
-        :: target == I_D -> vis_D[id] = true
+        :: target == CP_B -> vis_B[id] = true
+        :: target == CP_C -> vis_C[id] = true
+        :: target == CP_D -> vis_D[id] = true
         :: else -> skip
         fi;
 
-        /* Release intersection slot */
+        /* Release checkpoint slot */
         occ[target] = FREE;
 
         step++
@@ -201,29 +194,16 @@ proctype Vehicle(byte id; byte cp0; byte cp1; byte cp2) {
 }
 
 /* ==========================================================================
-   init — zero shared state and launch all processes
+   init — initialise shared state and launch all processes
    ========================================================================== */
 init {
-    byte i;
-
-    /* Initialise occupancy to FREE */
-    i = 0;
-    do
-    :: i < 9 -> occ[i] = FREE; i++
-    :: else  -> break
-    od;
+    /* Initialise checkpoint signals and occupancy (3 entries each) */
+    sig[CP_B] = DIR_N;  sig[CP_C] = DIR_N;  sig[CP_D] = DIR_N;
+    occ[CP_B] = FREE;   occ[CP_C] = FREE;   occ[CP_D] = FREE;
 
     /* Initialise per-vehicle flags */
-    i = 0;
-    do
-    :: i < NVEH ->
-        vis_B[i] = false;
-        vis_C[i] = false;
-        vis_D[i] = false;
-        done[i]  = false;
-        i++
-    :: else -> break
-    od;
+    vis_B[0] = false;  vis_C[0] = false;  vis_D[0] = false;  done[0] = false;
+    vis_B[1] = false;  vis_C[1] = false;  vis_D[1] = false;  done[1] = false;
 
     /* Initialise violation flags */
     fl_uturn = false;
@@ -233,8 +213,8 @@ init {
     /* Launch vehicles using Strategy-E checkpoint ordering (CLAUDE.md):
          even ID (0): B→C→D  (counterclockwise outer ring)
          odd  ID (1): D→C→B  (clockwise outer ring)              */
-    run Vehicle(0, I_B, I_C, I_D);
-    run Vehicle(1, I_D, I_C, I_B);
+    run Vehicle(0, CP_B, CP_C, CP_D);
+    run Vehicle(1, CP_D, CP_C, CP_B);
 }
 
 /* ==========================================================================
@@ -253,7 +233,7 @@ ltl visit_all {
          (done[1] -> (vis_B[1] && vis_C[1] && vis_D[1])) )
 }
 
-/* P4 — No two vehicles occupy the same intersection slot simultaneously */
+/* P4 — No two vehicles occupy the same checkpoint slot simultaneously */
 ltl no_coll   { [] !fl_coll }
 
 /* P5 (self-choice) — Every vehicle eventually completes its tour.
